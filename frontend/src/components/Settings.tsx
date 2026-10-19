@@ -1,0 +1,21 @@
+import { useState } from 'react';
+import { CheckCircle2, PlugZap, RefreshCw, Server, ShieldCheck } from 'lucide-react';
+import { api } from '../lib/api';
+import { record, text } from '../lib/model';
+import { useAuth } from '../auth';
+import { Badge, Button, Empty, Notice } from './ui';
+
+/** Render unknown backend status fields without assuming a provider-specific schema. */
+export function SafeFields({ value, depth = 0 }: { value: unknown; depth?: number }) {
+  if (value == null) return <span className="muted">Not reported</span>;
+  if (typeof value === 'boolean') return <Badge tone={value ? 'green' : ''}>{value ? 'yes' : 'no'}</Badge>;
+  if (typeof value !== 'object') return <span className="field-value">{String(value)}</span>;
+  if (Array.isArray(value)) return <div className="safe-array">{value.length ? value.map((v, i) => <div key={i}><SafeFields value={v} depth={depth + 1} /></div>) : <span className="muted">None reported</span>}</div>;
+  return <dl className={`safe-fields ${depth ? 'nested' : ''}`}>{Object.entries(record(value)).filter(([key]) => !/(?:secret|password|token|(?:api|anon|service_role)_key)$/i.test(key)).map(([key, v]) => <div key={key}><dt>{key.replaceAll('_', ' ')}</dt><dd><SafeFields value={v} depth={depth + 1} /></dd></div>)}</dl>;
+}
+export function SettingsPage() {
+  const { settings, settingsError, reloadSettings, auth } = useAuth(); const [results, setResults] = useState<unknown>(null); const [busy, setBusy] = useState(false); const [refreshing, setRefreshing] = useState(false); const [error, setError] = useState('');
+  const integrations = settings?.integrations ?? settings?.providers;
+  const extras = Object.fromEntries(Object.entries(settings || {}).filter(([k]) => !['integrations', 'providers', 'limits', 'auth_mode'].includes(k)));
+  return <div className="page-container settings-page"><header className="page-heading"><div><span className="eyebrow">LAB CONFIGURATION</span><h1>Connected systems<span className="lime-text">.</span></h1><p>Real integration status, straight from the backend.</p></div><Button busy={refreshing} onClick={async () => { setRefreshing(true); await reloadSettings(); setRefreshing(false); }}><RefreshCw size={15} />Refresh status</Button></header>{settingsError && <Notice>{settingsError}</Notice>}<div className="settings-grid"><section className="panel"><div className="panel-top"><h2><PlugZap size={18} />Research integrations</h2><Badge>REDACTED</Badge></div><div className="panel-content">{integrations ? <SafeFields value={integrations} /> : <Empty title="No integration inventory returned">Status fields reported by the API are shown below. Configure providers in the backend environment and refresh.</Empty>}<Notice kind="info">Missing credentials? Set the relevant provider keys in the backend environment, restart the API, then test connectivity here. Provider secrets stay on the server.</Notice><Button variant="primary" busy={busy} onClick={async () => { setBusy(true); setError(''); try { setResults(await api.testSettings()); await reloadSettings(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } }}><PlugZap size={16} />Test live connectivity</Button>{error && <Notice>{error}</Notice>}{results !== null && <div className="test-results"><h3><CheckCircle2 size={16} />Connectivity test response</h3><SafeFields value={results} /></div>}</div></section><aside className="settings-side"><section className="panel"><div className="panel-top"><h2><ShieldCheck size={17} />Access mode</h2></div><div className="panel-content"><Badge tone="green">{text(settings?.auth_mode || record(settings?.auth).mode) || 'Not reported'}</Badge><p className="muted">{auth ? `Signed in as ${auth.user.email || auth.user.id}` : 'Local mode is intended for a single user on a loopback-only backend.'}</p></div></section><section className="panel"><div className="panel-top"><h2><Server size={17} />Execution limits</h2></div><div className="panel-content"><SafeFields value={settings?.limits} /></div></section></aside></div>{Object.keys(extras).length > 0 && <section className="panel settings-additional"><div className="panel-top"><h2>Backend configuration</h2></div><div className="panel-content"><SafeFields value={extras} /></div></section>}</div>;
+}

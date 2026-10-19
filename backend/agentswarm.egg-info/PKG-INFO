@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: agentswarm
+Version: 0.1.0
+Summary: Evidence-driven autonomous multi-agent research
+Requires-Python: <3.14,>=3.13
+Requires-Dist: fastapi<1,>=0.115
+Requires-Dist: uvicorn<1,>=0.34
+Requires-Dist: pydantic-settings<3,>=2.8
+Requires-Dist: sqlalchemy<3,>=2.0
+Requires-Dist: psycopg[binary]<4,>=3.2
+Requires-Dist: httpx<1,>=0.28
+Requires-Dist: langgraph<2,>=0.6
+Requires-Dist: pypdf<7,>=5
+Requires-Dist: beautifulsoup4<5,>=4.13
+Requires-Dist: python-multipart<1,>=0.0.20
+Requires-Dist: reportlab<5,>=4.3
+Requires-Dist: PyJWT[crypto]<3,>=2.10
+Provides-Extra: test
+Requires-Dist: pytest<10,>=8.3; extra == "test"
+Requires-Dist: pytest-asyncio<2,>=0.25; extra == "test"

@@ -1,0 +1,12 @@
+fastapi==0.136.0
+uvicorn==0.44.0
+pydantic-settings==2.16.0
+SQLAlchemy==2.0.39
+psycopg[binary]==3.3.6
+httpx==0.28.1
+langgraph==1.2.16
+pypdf==6.21.1
+beautifulsoup4==4.15.0
+python-multipart==0.0.32
+reportlab==4.5.1
+PyJWT[crypto]==2.10.1
