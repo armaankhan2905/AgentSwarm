@@ -1,7 +1,7 @@
 """Validated server configuration. Credentials never belong in API responses."""
 
 from functools import lru_cache
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 import base64
 import binascii
 import json
@@ -86,7 +86,16 @@ class Settings(BaseSettings):
     max_total_sessions_per_user: int = Field(default=500, ge=1, le=10000)
     max_history_items: int = Field(default=100, ge=1, le=500)
     max_pdf_concurrency: int = Field(default=2, ge=1, le=8)
+    max_pdf_objects: int = Field(default=100_000, ge=100, le=1_000_000)
+    pdf_parse_timeout_seconds: float = Field(default=10, ge=1, le=120)
     connectivity_cooldown_seconds: float = Field(default=60, ge=1, le=3600)
+    research_rate_limit: int = Field(default=10, ge=1, le=1000)
+    research_rate_window_seconds: float = Field(default=60, ge=1, le=3600)
+    upload_rate_limit: int = Field(default=10, ge=1, le=1000)
+    upload_rate_window_seconds: float = Field(default=60, ge=1, le=3600)
+    event_replay_limit: int = Field(default=250, ge=1, le=5000)
+    event_audit_tail: int = Field(default=500, ge=1, le=10000)
+    trusted_proxy_cidrs: str = "127.0.0.1/32,::1/128"
     request_body_timeout_seconds: float = Field(default=60, ge=5, le=600)
     max_json_bytes: int = Field(default=128 * 1024, ge=1024, le=1024 * 1024)
     connectivity_timeout_seconds: float = Field(default=15, ge=1, le=60)
@@ -142,6 +151,16 @@ class Settings(BaseSettings):
                 raise ValueError("CORS_ORIGINS must contain origins, not paths")
         return value
 
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def trusted_proxy_cidrs_valid(cls, value: str) -> str:
+        for cidr in filter(None, (part.strip() for part in value.split(","))):
+            try:
+                ip_network(cidr, strict=False)
+            except ValueError as exc:
+                raise ValueError("TRUSTED_PROXY_CIDRS must contain valid IP networks") from exc
+        return value
+
     @model_validator(mode="after")
     def validate_server(self) -> "Settings":
         if not self.llm_model:
@@ -165,6 +184,14 @@ class Settings(BaseSettings):
     @property
     def origins(self) -> list[str]:
         return [item.strip().rstrip("/") for item in self.cors_origins.split(",") if item.strip()]
+
+    @property
+    def trusted_proxy_networks(self):
+        return [
+            ip_network(item.strip(), strict=False)
+            for item in self.trusted_proxy_cidrs.split(",")
+            if item.strip()
+        ]
 
     def missing_credentials(self, source_types: list[str]) -> list[str]:
         missing = []

@@ -1,6 +1,7 @@
 """Explicit local trust boundary or real Supabase Auth token verification."""
 
 from dataclasses import dataclass
+from ipaddress import ip_address
 from uuid import UUID
 
 import httpx
@@ -27,11 +28,24 @@ async def current_user(request: Request) -> Identity:
         if not request.client:
             raise HTTPException(403, "Local single-user mode is restricted to loopback connections")
         peer = request.client.host
-        if is_loopback(peer) and request.headers.get("x-real-ip"):
-            peer = request.headers["x-real-ip"].strip()
+        try:
+            peer_address = ip_address(peer)
+        except ValueError:
+            raise HTTPException(403, "Local single-user mode is restricted to loopback connections") from None
+        trusted_proxy = any(peer_address in network for network in settings.trusted_proxy_networks)
+        real_ip = request.headers.get("x-real-ip", "").strip()
+        if trusted_proxy and real_ip:
+            # X-Real-IP is a single hop value. Reject lists and malformed
+            # values instead of selecting an attacker-controlled entry.
+            try:
+                if "," in real_ip or ";" in real_ip:
+                    raise ValueError
+                peer = str(ip_address(real_ip))
+            except ValueError:
+                raise HTTPException(403, "Invalid trusted proxy client address") from None
         if not is_loopback(peer):
             raise HTTPException(403, "Local single-user mode is restricted to loopback connections")
-        if not request.headers.get("x-real-ip") and not is_loopback(request.url.hostname):
+        if not real_ip and not is_loopback(request.url.hostname):
             raise HTTPException(403, "Local single-user mode requires a loopback host")
         origin = request.headers.get("origin")
         if origin and origin.rstrip("/") not in settings.origins:

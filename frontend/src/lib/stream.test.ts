@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { createSSEParser } from './stream';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createSSEParser, streamEvents } from './stream';
+
+afterEach(() => vi.restoreAllMocks());
 
 describe('authenticated stream frame parsing', () => {
   it('parses split CRLF frames and multiline data without inventing events', () => {
@@ -15,5 +17,14 @@ describe('authenticated stream frame parsing', () => {
     expect(received).toEqual([]);
     parse('tial"}\n\n');
     expect(received).toEqual([{ id: 1, message: 'partial' }]);
+  });
+
+  it('reconnects with both the cursor query and Last-Event-ID header', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new ReadableStream({ start(controller) { controller.close(); } }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    await streamEvents('session/1', 41, new AbortController().signal, () => {}, () => {});
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/research/session%2F1/stream?after=41');
+    expect(new Headers(init.headers).get('Last-Event-ID')).toBe('41');
   });
 });

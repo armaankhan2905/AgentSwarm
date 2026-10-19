@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../lib/api';
-import { isActive, mergeEvents } from '../lib/model';
+import { isActive, mergeEvents, normalizeEvent } from '../lib/model';
 import { streamEvents } from '../lib/stream';
 import type { Session, ResearchEvent } from '../types';
 
@@ -39,13 +39,14 @@ export function useResearch(id: string) {
     };
 
     const accept = (event: ResearchEvent) => {
-      if (event.session_id && event.session_id !== id) return;
-      if (Number.isFinite(Number(event.id)) && Number.isFinite(Number(cursor))) {
-        cursor = Math.max(Number(cursor), Number(event.id));
+      const normalized = normalizeEvent(event);
+      if (!normalized || (normalized.session_id && normalized.session_id !== id)) return;
+      if (Number.isFinite(Number(normalized.id)) && Number.isFinite(Number(cursor))) {
+        cursor = Math.max(Number(cursor), Number(normalized.id));
       } else {
-        cursor = event.id;
+        cursor = normalized.id;
       }
-      setEvents(old => mergeEvents(old, [event]));
+      setEvents(old => mergeEvents(old, [normalized]));
       schedule();
     };
 
@@ -110,7 +111,7 @@ export function useResearch(id: string) {
     void (async () => {
       await load(false);
       try {
-        const persisted = await api.events(id, signal);
+        const persisted = await api.events(id, signal, cursor);
         for (const event of persisted) accept(event);
       } catch (e) {
         if (!signal.aborted) setStreamStatus(`Event replay unavailable: ${(e as Error).message}`);

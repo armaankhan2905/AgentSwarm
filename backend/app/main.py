@@ -10,6 +10,7 @@ import re
 import time
 from typing import Annotated, Literal
 from uuid import UUID
+from uuid import uuid4
 from urllib.parse import quote
 from xml.sax.saxutils import escape
 
@@ -112,6 +113,11 @@ def redact(value, settings: Settings):
     return value
 
 
+def structured_log(level: int, event: str, settings: Settings, **fields):
+    payload = {"event": event, **fields}
+    logger.log(level, json.dumps(redact(payload, settings), ensure_ascii=False, separators=(",", ":"), default=str))
+
+
 class ExecutionManager:
     def __init__(self, app: FastAPI):
         self.app = app
@@ -179,7 +185,7 @@ class ExecutionManager:
                     raise last_error
 
                 async def cancelled() -> bool:
-                    current = self.db.get_session(session_id)
+                    current = self.db.get_session_status(session_id)
                     return self.stopping or current is None or current["status"] == "cancelled"
 
                 factory = self.app.state.engine_factory
@@ -201,19 +207,23 @@ class ExecutionManager:
                 report = result.get("report") or {}
                 complete = bool(report.get("markdown")) and report.get("citation_audit", {}).get("passed") is True
                 requested_status = result.get("status")
-                status = "completed" if complete and requested_status not in {"incomplete", "failed"} else "incomplete"
+                if requested_status is not None and requested_status not in TERMINAL_STATUSES:
+                    raise ValueError("Engine returned an invalid terminal session status")
+                status = "completed" if complete and requested_status not in {"incomplete", "failed", "cancelled"} else "incomplete"
                 if requested_status == "failed":
                     status = "failed"
+                elif requested_status == "cancelled":
+                    status = "cancelled"
                 self.db.transition(session_id, status)
         except asyncio.CancelledError:
-            self.safe_transition(session_id, "incomplete", error="Execution interrupted. Latest checkpoint retained; submit a follow-up to continue.")
+            await self.safe_transition(session_id, "incomplete", error="Execution interrupted. Latest checkpoint retained; submit a follow-up to continue.")
             raise
         except Exception as exc:
             # Provider exception text may contain request URLs, tokens, or response bodies.
             logger.error("Research execution failed (%s)", type(exc).__name__)
-            self.safe_transition(session_id, "failed", error="Research execution failed. Latest checkpoint retained. Check provider configuration and submit a follow-up to retry.")
+            await self.safe_transition(session_id, "failed", error="Research execution failed. Latest checkpoint retained. Check provider configuration and submit a follow-up to retry.")
 
-    def safe_transition(self, session_id: str, status: str, *, error: str | None = None):
+    async def safe_transition(self, session_id: str, status: str, *, error: str | None = None):
         """Do not let a reporting failure escape and strand a durable run forever."""
         for attempt in range(3):
             try:
@@ -222,7 +232,7 @@ class ExecutionManager:
                 if attempt == 2:
                     logger.error("Could not persist session %s terminal status", session_id)
                 else:
-                    time.sleep(0.05 * (attempt + 1))
+                    await asyncio.sleep(0.05 * (attempt + 1))
         return False
 
     def cancel(self, session_id: str):
@@ -233,7 +243,7 @@ class ExecutionManager:
     async def shutdown(self):
         self.stopping = True
         for session_id, task in list(self.tasks.items()):
-            self.safe_transition(session_id, "incomplete", error="Execution interrupted by server shutdown. Latest checkpoint retained.")
+            await self.safe_transition(session_id, "incomplete", error="Execution interrupted by server shutdown. Latest checkpoint retained.")
             task.cancel()
         if self.tasks:
             await asyncio.wait(list(self.tasks.values()), timeout=10)
@@ -314,6 +324,15 @@ async def connectivity_test(app: FastAPI, integration: str) -> dict:
 
 
 def extract_pdf(data: bytes, settings: Settings) -> tuple[list[dict], str]:
+    if len(data) > settings.max_upload_bytes or len(data) < 8:
+        raise HTTPException(422, "Upload is not a valid PDF")
+    # PDF headers may be preceded by a bounded binary preamble, but accepting
+    # an arbitrary prefix makes file-type checks easy to evade. The EOF check
+    # rejects truncated bodies before pypdf allocates parser structures.
+    if data[:1024].find(b"%PDF-") < 0 or b"%%EOF" not in data[-1024:]:
+        raise HTTPException(422, "Upload is not a valid PDF")
+    if len(re.findall(rb"\b\d+\s+\d+\s+obj\b", data)) > settings.max_pdf_objects:
+        raise HTTPException(422, "PDF contains too many objects")
     try:
         reader = PdfReader(BytesIO(data), strict=True)
         if reader.is_encrypted:
@@ -383,7 +402,11 @@ def report_markdown(report: dict) -> str:
 
 def create_app(settings: Settings | None = None, database: Database | None = None) -> FastAPI:
     settings = settings or get_settings()
-    database = database or Database(settings.database_url)
+    database = database or Database(
+        settings.database_url,
+        event_replay_limit=settings.event_replay_limit,
+        event_audit_tail=settings.event_audit_tail,
+    )
 
     # Current provider adapters read their integration credentials directly from the
     # agreed environment names. Keep this compatibility bridge in the API boundary;
@@ -412,8 +435,6 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         app.state.http = httpx.AsyncClient(follow_redirects=False, trust_env=False)
         app.state.execution = ExecutionManager(app)
         app.state.pdf_semaphore = asyncio.Semaphore(settings.max_pdf_concurrency)
-        app.state.connectivity_lock = asyncio.Lock()
-        app.state.connectivity_last = {}
         try:
             yield
         finally:
@@ -427,6 +448,38 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
     app.add_middleware(BodyLimitMiddleware, settings=settings)
     app.add_middleware(CORSMiddleware, allow_origins=settings.origins, allow_credentials=False, allow_methods=["GET", "POST", "DELETE"], allow_headers=["Authorization", "Content-Type", "Last-Event-ID"], expose_headers=["Content-Disposition"])
 
+    @app.middleware("http")
+    async def request_logging(request: Request, call_next):
+        supplied = request.headers.get("x-request-id", "")
+        request_id = supplied if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", supplied) else str(uuid4())
+        request.state.request_id = request_id
+        started = time.monotonic()
+        try:
+            response = await call_next(request)
+        except Exception:
+            structured_log(
+                logging.ERROR,
+                "request_failed",
+                settings,
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+            raise
+        response.headers["X-Request-ID"] = request_id
+        structured_log(
+            logging.INFO,
+            "request_completed",
+            settings,
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+        return response
+
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):
         # FastAPI's default includes raw invalid input and exception context.
@@ -435,7 +488,13 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
 
     @app.exception_handler(Exception)
     async def server_error(request: Request, exc: Exception):
-        logger.error("API request failed (%s)", type(exc).__name__)
+        structured_log(
+            logging.ERROR,
+            "api_exception",
+            settings,
+            request_id=getattr(request.state, "request_id", ""),
+            exception_type=type(exc).__name__,
+        )
         return JSONResponse({"detail": "The server could not complete this request"}, status_code=500)
 
     def owned_session(session_id: str, user: Identity) -> dict:
@@ -444,6 +503,16 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         except ValueError:
             raise HTTPException(404, "Research session not found") from None
         value = database.get_session(session_id, user.id)
+        if value is None:
+            raise HTTPException(404, "Research session not found")
+        return value
+
+    def owned_session_status(session_id: str, user: Identity) -> dict:
+        try:
+            session_id = str(UUID(session_id))
+        except ValueError:
+            raise HTTPException(404, "Research session not found") from None
+        value = database.get_session_status(session_id, user.id)
         if value is None:
             raise HTTPException(404, "Research session not found")
         return value
@@ -467,19 +536,35 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         status = 503 if "queue is full" in str(exc).lower() else 429
         return HTTPException(status, str(exc), headers={"Retry-After": "10"})
 
+    def enforce_rate_limit(key: str, *, limit: int, window_seconds: float, message: str):
+        decision = database.consume_rate_limit(key, limit=limit, window_seconds=window_seconds)
+        if not decision.allowed:
+            raise HTTPException(429, message, headers={"Retry-After": str(decision.retry_after)})
+
     async def allow_connectivity_test(user_id: str):
-        now = time.monotonic()
-        async with app.state.connectivity_lock:
-            previous = app.state.connectivity_last.get(user_id, 0.0)
-            elapsed = now - previous
-            if elapsed < settings.connectivity_cooldown_seconds:
-                retry_after = max(1, int(settings.connectivity_cooldown_seconds - elapsed))
-                raise HTTPException(429, "Connectivity tests are rate-limited; retry later", headers={"Retry-After": str(retry_after)})
-            app.state.connectivity_last[user_id] = now
+        enforce_rate_limit(
+            f"connectivity:{user_id}",
+            limit=1,
+            window_seconds=settings.connectivity_cooldown_seconds,
+            message="Connectivity tests are rate-limited; retry later",
+        )
 
     @app.get("/api/health")
     async def health():
         return {"status": "ok"}
+
+    @app.get("/api/readiness")
+    async def readiness():
+        checks = {"database": "ok", "configuration": "ok"}
+        try:
+            database.readiness()
+        except Exception:
+            checks["database"] = "unavailable"
+        ready = all(value == "ok" for value in checks.values())
+        return JSONResponse(
+            {"status": "ready" if ready else "not_ready", "checks": checks},
+            status_code=200 if ready else 503,
+        )
 
     @app.get("/api/bootstrap")
     async def bootstrap():
@@ -520,6 +605,12 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         if selected_chars > settings.max_selected_document_chars:
             raise HTTPException(413, "Selected documents exceed the aggregate extracted-text limit")
         provider_ready(body.source_types)
+        enforce_rate_limit(
+            f"research:{user.id}",
+            limit=settings.research_rate_limit,
+            window_seconds=settings.research_rate_window_seconds,
+            message="Research creation is rate-limited; retry later",
+        )
         async with app.state.execution.queue_lock:
             app.state.execution.check_capacity(user.id)
             try:
@@ -579,7 +670,7 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
 
     @app.get("/api/research/{session_id}/stream")
     async def stream(session_id: str, request: Request, user: User, after: int = Query(default=0, ge=0, le=2147483647)):
-        session = owned_session(session_id, user)
+        session = owned_session_status(session_id, user)
         cursor = request.headers.get("last-event-id")
         if cursor is not None:
             try:
@@ -595,15 +686,15 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             while True:
                 if await request.is_disconnected():
                     return
-                current = database.get_session(session["id"], user.id)
+                current = database.get_session_status(session["id"], user.id)
                 if current is None:
                     return
-                batch = database.events(session["id"], after, limit=250)
+                batch = database.events(session["id"], after, limit=settings.event_replay_limit)
                 for item in batch:
                     after = item["id"]
                     payload = json.dumps(redact(item, settings), ensure_ascii=False, separators=(",", ":"))
                     yield f"id: {after}\nevent: research\ndata: {payload}\n\n"
-                if len(batch) == 250:
+                if len(batch) == settings.event_replay_limit:
                     continue
                 if current["status"] in TERMINAL_STATUSES:
                     return
@@ -640,10 +731,17 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         return redact({**claim, "evidence": evidence, "sources": sources}, settings)
 
     @app.get("/api/research/{session_id}/{resource}")
-    async def child_resource(session_id: str, resource: str, user: User):
-        session = owned_session(session_id, user)
+    async def child_resource(
+        session_id: str,
+        resource: str,
+        user: User,
+        after: int = Query(default=0, ge=0, le=2147483647),
+        limit: int = Query(default=250, ge=1, le=5000),
+    ):
         if resource == "events":
-            return redact(database.events(session["id"]), settings)
+            session = owned_session_status(session_id, user)
+            return redact(database.events(session["id"], after=after, limit=min(limit, settings.event_replay_limit)), settings)
+        session = owned_session(session_id, user)
         if resource not in {"plan", "sources", "claims", "conflicts", "gaps", "report"}:
             raise HTTPException(404, "Resource not found")
         return redact(session["state"].get(resource, {} if resource in {"plan", "report"} else []), settings)
@@ -653,13 +751,23 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         try:
             if file.content_type not in {"application/pdf", "application/octet-stream"}:
                 raise HTTPException(415, "Only PDF uploads are supported")
+            enforce_rate_limit(
+                f"upload:{user.id}",
+                limit=settings.upload_rate_limit,
+                window_seconds=settings.upload_rate_window_seconds,
+                message="PDF uploads are rate-limited; retry later",
+            )
             data = await file.read(settings.max_upload_bytes + 1)
             if len(data) > settings.max_upload_bytes:
                 raise HTTPException(413, "PDF exceeds the upload size limit")
-            if not data.startswith(b"%PDF-"):
-                raise HTTPException(422, "Upload is not a valid PDF")
             async with app.state.pdf_semaphore:
-                pages, status = await asyncio.to_thread(extract_pdf, data, settings)
+                try:
+                    pages, status = await asyncio.wait_for(
+                        asyncio.to_thread(extract_pdf, data, settings),
+                        timeout=settings.pdf_parse_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    raise HTTPException(422, "PDF parsing timed out") from None
             # The original filename is display text only; no upload ever becomes a path.
             title = (file.filename or "Untitled PDF").replace("\\", "/").rsplit("/", 1)[-1]
             title = "".join(char for char in title if char.isprintable())[:200] or "Untitled PDF"
@@ -675,6 +783,10 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             return redact(document, settings)
         finally:
             await file.close()
+
+    @app.get("/api/documents")
+    async def list_documents(user: User, limit: int = Query(default=1000, ge=1, le=1000)):
+        return redact(database.list_documents(user.id, min(limit, settings.max_documents_per_user)), settings)
 
     @app.get("/api/documents/{document_id}")
     async def get_document(document_id: str, user: User):

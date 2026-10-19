@@ -13,7 +13,7 @@ only in tests. Missing credentials are a setup error, never a demo-data fallback
 - `backend/app/database.py`, `main.py`, `auth.py`: storage, API and ownership.
 - `frontend/`: React/Vite/TypeScript client, proxying `/api` in development.
 - `backend/tests/`: offline deterministic tests.
-- `supabase/migrations/`: PostgreSQL schema and RLS setup.
+- `supabase/migrations/`: ordered PostgreSQL schema, privileges, and RLS setup.
 
 ## Shared Python contract
 
@@ -92,14 +92,33 @@ Missing LLM or selected web provider credentials must reject creation with actio
 
 ## Security / deployment
 
-Local mode is explicitly single-user, loopback-only. When a trusted reverse proxy
+Local mode is explicitly single-user, loopback-only. The Vite development and
+preview servers bind to `127.0.0.1`; the local backend development command must
+also use a loopback bind. When a trusted reverse proxy
 is used it must overwrite `X-Real-IP`; `Host` and user-supplied forwarded headers
 are never trusted. The public combined Docker image refuses local mode by default.
 Supabase mode validates access
 tokens with Supabase Auth and checks owner on every route, including stream and export.
-PostgreSQL deployment uses Supabase migrations and RLS; browser table DML is revoked
-because the backend is the API integrity boundary. Local SQLite supports offline
-tests without pretending to be Supabase. No keys are returned from settings. Retrieval
-rejects private/link-local/loopback IPs, unsafe schemes and redirects to unsafe hosts.
+The required Supabase authorization format is `Authorization: Bearer <access-token>`;
+the public anon key identifies the Supabase project and is not an access token.
+PostgreSQL deployment applies migrations 001–003 in order. Every application table
+has forced RLS and owner-scoped `authenticated` policies, while browser table DML
+and schema access are revoked; the server-only database role is the API integrity
+boundary and must have explicit schema/table/sequence privileges. Local SQLite
+supports offline tests without pretending to be Supabase. No keys are returned
+from settings. Retrieval rejects private/link-local/loopback IPs, unsafe schemes
+and redirects to unsafe hosts.
+
+The combined image runs nginx as a non-root UID on port 8080 and keeps Uvicorn on
+loopback port 8000. Entrypoint readiness waits for `/api/health` after the API
+lifespan has initialized the configured database; Docker then probes that route
+through nginx. `ALLOW_INSECURE_DOCKER_LOCAL_AUTH=1` is accepted only with
+`AUTH_MODE=local`, `APP_ENV=development`, and `DEPLOYMENT_SCOPE=isolated`.
+Shared/production containers must use Supabase auth and leave that flag at `0`.
+Tavily, LLM, database, and service-role credentials are server-only; only the
+Supabase URL and anon key may be placed in `VITE_*` browser configuration.
+The nginx boundary emits one consistent set of security headers, including
+content-type, framing, referrer, permissions, and CSP controls. TLS termination
+and HSTS belong at the external HTTPS boundary.
 External content is data only. LLM outputs must be schema-validated and evidence IDs
 validated deterministically before they are accepted.

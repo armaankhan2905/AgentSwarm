@@ -41,5 +41,17 @@ export interface Session {
 }
 export interface ResearchEvent { id: string | number; session_id: string; event_type: string; agent: string; message: string; data?: RecordData; timestamp: string }
 export interface Settings extends RecordData { auth_mode?: string; supabase_url?: string; supabase_anon_key?: string; integrations?: unknown; limits?: unknown }
-export interface UploadedDocument { id: string; title?: string; pages?: unknown[]; text_chars?: number; extraction_status?: string; [key: string]: unknown }
+export interface UploadedDocument {
+  id: string;
+  title?: string;
+  pages?: unknown[];
+  text_chars?: number;
+  extraction_status?: string;
+  size_bytes?: number;
+  created_at?: string;
+  in_use?: boolean;
+  active_session_count?: number;
+  deletable?: boolean;
+  [key: string]: unknown;
+}
 export interface ClaimDetail extends Claim { evidence: Passage[]; sources: Source[] }

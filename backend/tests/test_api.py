@@ -1,9 +1,11 @@
 """Offline API/storage boundary tests. Synthetic engines/transports exist only here."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from io import BytesIO
 import json
+import logging
 import time
 from uuid import uuid4
 
@@ -18,7 +20,7 @@ from app.auth import LOCAL_USER_ID
 from app.config import Settings
 from app.database import (
     Claim, Conflict, Database, Document, Evidence, Followup, Gap, Plan,
-    Relationship, Report, ResearchEvent, ResearchSession, Source, Task,
+    RateLimitBucket, Relationship, Report, ResearchEvent, ResearchSession, Source, Task,
 )
 from app.main import create_app
 
@@ -300,6 +302,7 @@ def test_pdf_upload_page_extraction_and_document_input(api):
     assert document["extraction_status"] == "extracted"
     assert [page["page"] for page in document["pages"]] == [1, 2]
     assert "Second page evidence." in document["pages"][1]["text"]
+    assert client.get("/api/documents").json() == [document]
     assert client.get(f"/api/documents/{document['id']}").json() == document
     inputs = []
 
@@ -387,6 +390,105 @@ def test_pdf_page_size_and_empty_text_limits(tmp_path):
         assert blank["extraction_status"] == "no_text"
         response = client.post("/api/research", json={**REQUEST, "source_types": ["document"], "document_ids": [blank["id"]]})
         assert response.status_code == 422
+
+
+def test_pdf_resource_signature_and_object_limits(tmp_path):
+    app = create_app(config(tmp_path, max_pdf_objects=100))
+    with TestClient(app, base_url="http://localhost", client=("127.0.0.1", 50000)) as client:
+        body = b"%PDF-1.7\n" + (b"1 0 obj\n" * 101) + b"%%EOF"
+        response = client.post("/api/documents", files={"file": ("objects.pdf", body, "application/pdf")})
+        assert response.status_code == 422 and "objects" in response.text
+
+
+def test_health_readiness_and_redacted_request_correlation(tmp_path, caplog):
+    app = create_app(config(tmp_path))
+    with TestClient(app, base_url="http://localhost", client=("127.0.0.1", 50000)) as client:
+        assert client.get("/api/health").json() == {"status": "ok"}
+        ready = client.get("/api/readiness", headers={"X-Request-ID": "trace-123"})
+        assert ready.status_code == 200
+        assert ready.headers["x-request-id"] == "trace-123"
+        assert ready.json() == {"status": "ready", "checks": {"database": "ok", "configuration": "ok"}}
+        with caplog.at_level(logging.INFO, logger="app.main"):
+            client.get("/api/settings", headers={"X-Request-ID": "safe-trace"})
+        assert "request_completed" in caplog.text
+        assert "test-llm-secret" not in caplog.text
+        app.state.database.readiness = lambda: (_ for _ in ()).throw(RuntimeError("database-password"))
+        unavailable = client.get("/api/readiness")
+        assert unavailable.status_code == 503
+        assert unavailable.json() == {"status": "not_ready", "checks": {"database": "unavailable", "configuration": "ok"}}
+        assert "database-password" not in unavailable.text
+
+
+def test_database_rate_limit_is_atomic_across_workers(tmp_path):
+    url = f"sqlite:///{(tmp_path / 'shared.sqlite').as_posix()}"
+    databases = [Database(url) for _ in range(4)]
+    databases[0].initialize()
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        decisions = list(pool.map(
+            lambda index: databases[index % len(databases)].consume_rate_limit(
+                "research:shared-user", limit=3, window_seconds=60
+            ),
+            range(24),
+        ))
+    assert sum(decision.allowed for decision in decisions) == 3
+    assert all(decision.retry_after > 0 for decision in decisions if not decision.allowed)
+    with databases[0].sessions() as db:
+        assert db.scalar(select(func.count()).select_from(RateLimitBucket)) == 1
+    for database in databases:
+        database.engine.dispose()
+
+
+def test_research_and_upload_limits_are_shared_api_boundaries(tmp_path):
+    app = create_app(config(tmp_path, research_rate_limit=1, upload_rate_limit=1))
+    app.state.engine_factory = CompleteEngine
+    with TestClient(app, base_url="http://localhost", client=("127.0.0.1", 50000)) as client:
+        first = client.post("/api/research", json=REQUEST)
+        assert first.status_code == 202
+        limited_research = client.post("/api/research", json=REQUEST)
+        assert limited_research.status_code == 429
+        first_upload = client.post("/api/documents", files={"file": ("one.pdf", pdf_bytes("Evidence"), "application/pdf")})
+        assert first_upload.status_code == 201
+        limited_upload = client.post("/api/documents", files={"file": ("two.pdf", pdf_bytes("Evidence"), "application/pdf")})
+        assert limited_upload.status_code == 429
+
+
+def test_stream_uses_status_only_session_reads_and_terminal_event_retention(tmp_path):
+    app = create_app(config(tmp_path, event_audit_tail=2))
+    app.state.engine_factory = CompleteEngine
+    with TestClient(app, base_url="http://localhost", client=("127.0.0.1", 50000)) as client:
+        session_id = start(client)
+        wait_status(client, session_id)
+        original_get = app.state.database.get_session
+        app.state.database.get_session = lambda *args, **kwargs: pytest.fail("stream loaded the full JSON snapshot")
+        try:
+            assert client.get(f"/api/research/{session_id}/stream").status_code == 200
+        finally:
+            app.state.database.get_session = original_get
+
+        session = app.state.database.create_session(LOCAL_USER_ID, REQUEST, [])
+        for number in range(4):
+            assert app.state.database.append_event(session["id"], "audit", "test", f"event-{number}")
+        assert len(app.state.database.events(session["id"])) == 5
+        assert app.state.database.transition(session["id"], "completed")
+        retained = app.state.database.events(session["id"])
+        assert len(retained) == 2
+        assert retained[-1]["event_type"] == "session_completed"
+
+
+def test_invalid_engine_status_fails_closed_to_terminal_enum(api):
+    client, app = api
+
+    class InvalidStatusEngine:
+        async def run(self, *, initial_state, checkpoint, **kwargs):
+            state = research_state(initial_state)
+            state["status"] = "not-a-session-status"
+            await checkpoint(state)
+            return state
+
+    app.state.engine_factory = InvalidStatusEngine
+    result = wait_status(client, start(client))
+    assert result["status"] == "failed"
+    assert result["state"]["status"] == "failed"
 
 
 def test_missing_credentials_return_503_without_creating_session(tmp_path):

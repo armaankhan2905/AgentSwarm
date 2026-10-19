@@ -7,13 +7,14 @@ import { Workspace } from './components/Workspace';
 import { History } from './components/History';
 import { SettingsPage } from './components/Settings';
 import { text, record } from './lib/model';
+import { decodeResearchRoute } from './lib/route';
 
 function Lab() {
   const [path, setPath] = useState(window.location.pathname); const [mobileOpen, setMobileOpen] = useState(false); const [authError, setAuthError] = useState('');
   const { settings, settingsError, auth, client } = useAuth();
   useEffect(() => { const pop = () => { setPath(window.location.pathname); setMobileOpen(false); }; window.addEventListener('popstate', pop); return () => window.removeEventListener('popstate', pop); }, []);
   function navigate(next: string) { if (window.location.pathname !== next) window.history.pushState({}, '', next); setPath(next); setMobileOpen(false); window.scrollTo({ top: 0 }); }
-  const match = path.match(/^\/research\/([^/]+)\/?$/); const sessionId = match ? decodeURIComponent(match[1]) : '';
+  const sessionId = decodeResearchRoute(path) || '';
   const page = sessionId ? 'workspace' : path === '/history' ? 'history' : path === '/settings' ? 'settings' : 'new';
   const mode = text(settings?.auth_mode || record(settings?.auth).mode);
   const nav = [{ id: 'new', path: '/', label: 'Research lab', icon: FlaskConical }, { id: 'history', path: '/history', label: 'Investigations', icon: FolderClock }, { id: 'settings', path: '/settings', label: 'Connections', icon: Settings2 }];

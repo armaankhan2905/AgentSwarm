@@ -19,7 +19,6 @@ dependencies = [
   "beautifulsoup4>=4.13,<5",
   "python-multipart>=0.0.20,<1",
   "reportlab>=4.3,<5",
-  "PyJWT[crypto]>=2.10,<3",
 ]
 
 [project.optional-dependencies]

@@ -25,7 +25,7 @@ export function createSSEParser(emit: (event: ResearchEvent) => void) {
   };
 }
 export async function streamEvents(sessionId: string, after: string | number, signal: AbortSignal, emit: (event: ResearchEvent) => void, connected: () => void) {
-  const response = await authenticatedFetch(`/research/${encodeURIComponent(sessionId)}/stream?after=${encodeURIComponent(after)}`, { signal, headers: { Accept: 'text/event-stream' } });
+  const response = await authenticatedFetch(`/research/${encodeURIComponent(sessionId)}/stream?after=${encodeURIComponent(after)}`, { signal, headers: { Accept: 'text/event-stream', 'Last-Event-ID': String(after) } });
   if (!response.body) throw new Error('This browser cannot read the event stream. Snapshots will still refresh.');
   connected(); const reader = response.body.getReader(); const decoder = new TextDecoder(); const parse = createSSEParser(emit);
   try { while (!signal.aborted) { const result = await reader.read(); if (result.done) { parse(decoder.decode()); break; } parse(decoder.decode(result.value, { stream: true })); } }

@@ -2,6 +2,8 @@
 
 from copy import deepcopy
 from datetime import datetime, timezone
+from dataclasses import dataclass
+import time
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -11,11 +13,19 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+SESSION_STATUSES = {"queued", "running", "completed", "incomplete", "failed", "cancelled"}
+ACTIVE_STATUSES = {"queued", "running"}
 TERMINAL_STATUSES = {"completed", "incomplete", "failed", "cancelled"}
 
 
 class QuotaExceeded(ValueError):
     """A bounded per-user resource or lifecycle operation was refused."""
+
+
+@dataclass(frozen=True)
+class RateLimitDecision:
+    allowed: bool
+    retry_after: int = 0
 
 
 def now() -> str:
@@ -163,6 +173,16 @@ class SessionDocument(Base):
     document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True)
 
 
+class RateLimitBucket(Base):
+    """Shared fixed-window counters used by every API worker."""
+
+    __tablename__ = "rate_limit_buckets"
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    window_started: Mapped[float] = mapped_column()
+    count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[str] = mapped_column(String(40), default=now)
+
+
 def session_dict(row: ResearchSession, *, include_state: bool = True) -> dict:
     value = {key: getattr(row, key) for key in ("id", "question", "status", "request", "error", "created_at", "updated_at")}
     state = row.state or {}
@@ -176,12 +196,22 @@ def session_dict(row: ResearchSession, *, include_state: bool = True) -> dict:
     return value
 
 
+def session_status_dict(row) -> dict:
+    """Return only the columns needed by status, cancellation, and stream loops."""
+    return {
+        key: row[key]
+        for key in ("id", "owner_id", "status", "error", "updated_at")
+    }
+
+
 def event_dict(row: ResearchEvent) -> dict:
     return {key: getattr(row, key) for key in ("id", "session_id", "event_type", "agent", "message", "data", "timestamp")}
 
 
 class Database:
-    def __init__(self, url: str):
+    def __init__(self, url: str, *, event_replay_limit: int = 250, event_audit_tail: int = 500):
+        self.event_replay_limit = event_replay_limit
+        self.event_audit_tail = event_audit_tail
         options = {"pool_pre_ping": True}
         if url.startswith("sqlite:"):
             options["connect_args"] = {"check_same_thread": False, "timeout": 30}
@@ -206,6 +236,53 @@ class Database:
                 columns = {row[1] for row in connection.execute(sql_text("PRAGMA table_info(documents)"))}
                 if "text_chars" not in columns:
                     connection.execute(sql_text("ALTER TABLE documents ADD COLUMN text_chars INTEGER NOT NULL DEFAULT 0"))
+        else:
+            # The application owns this small operational table. Keeping its
+            # creation here avoids requiring a migration edit for deployments
+            # that already have the research schema installed.
+            RateLimitBucket.__table__.create(self.engine, checkfirst=True)
+
+    def readiness(self) -> bool:
+        with self.sessions() as db:
+            db.execute(sql_text("SELECT 1"))
+        return True
+
+    def consume_rate_limit(self, key: str, *, limit: int, window_seconds: float) -> RateLimitDecision:
+        """Atomically consume one fixed-window request from a shared counter.
+
+        The row is locked after an upsert. PostgreSQL row locks serialize workers,
+        while SQLite's write transaction lock provides the same behavior locally.
+        """
+        if limit < 1 or window_seconds <= 0:
+            raise ValueError("Rate-limit parameters must be positive")
+        if self.engine.dialect.name == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert
+        else:
+            from sqlalchemy.dialects.postgresql import insert
+        started = time.time()
+        with self.sessions.begin() as db:
+            statement = insert(RateLimitBucket).values(
+                key=key, window_started=started, count=0, updated_at=now()
+            ).on_conflict_do_nothing(index_elements=["key"])
+            db.execute(statement)
+            row = db.scalar(
+                select(RateLimitBucket).where(RateLimitBucket.key == key).with_for_update()
+            )
+            if row is None:
+                raise RuntimeError("Rate-limit bucket could not be created")
+            elapsed = max(0.0, started - row.window_started)
+            if elapsed >= window_seconds:
+                row.window_started = started
+                row.count = 1
+                allowed = True
+            elif row.count >= limit:
+                allowed = False
+            else:
+                row.count += 1
+                allowed = True
+            row.updated_at = now()
+            retry_after = max(1, int(window_seconds - elapsed + 0.999)) if not allowed else 0
+            return RateLimitDecision(allowed=allowed, retry_after=retry_after)
 
     def ensure_user(self, owner_id: str):
         # ON CONFLICT avoids two concurrent authenticated requests racing to create a user.
@@ -270,6 +347,21 @@ class Database:
             row = db.scalar(query)
             return session_dict(row) if row else None
 
+    def get_session_status(self, session_id: str, owner_id: str | None = None) -> dict | None:
+        """Read session metadata without loading/deserializing the JSON snapshot."""
+        with self.sessions() as db:
+            query = select(
+                ResearchSession.id,
+                ResearchSession.owner_id,
+                ResearchSession.status,
+                ResearchSession.error,
+                ResearchSession.updated_at,
+            ).where(ResearchSession.id == session_id)
+            if owner_id is not None:
+                query = query.where(ResearchSession.owner_id == owner_id)
+            row = db.execute(query).mappings().one_or_none()
+            return session_status_dict(row) if row else None
+
     def documents_for_session(self, session_id: str) -> list[dict]:
         with self.sessions() as db:
             query = (
@@ -278,6 +370,11 @@ class Database:
                 .where(SessionDocument.session_id == session_id)
                 .order_by(Document.created_at, Document.id)
             )
+            return [self.document_dict(row) for row in db.scalars(query)]
+
+    def list_documents(self, owner_id: str, limit: int = 1000) -> list[dict]:
+        with self.sessions() as db:
+            query = select(Document).where(Document.owner_id == owner_id).order_by(Document.created_at, Document.id).limit(limit)
             return [self.document_dict(row) for row in db.scalars(query)]
 
     def count_active_sessions(self, owner_id: str) -> int:
@@ -291,12 +388,42 @@ class Database:
 
     def list_sessions(self, owner_id: str, search: str, sort: str, limit: int = 100) -> list[dict]:
         with self.sessions() as db:
-            query = select(ResearchSession).where(ResearchSession.owner_id == owner_id)
+            source_count = select(func.count(Source.id)).where(Source.session_id == ResearchSession.id).scalar_subquery()
+            evidence_count = select(func.count(Evidence.id)).where(Evidence.session_id == ResearchSession.id).scalar_subquery()
+            claim_count = select(func.count(Claim.id)).where(Claim.session_id == ResearchSession.id).scalar_subquery()
+            query = select(
+                ResearchSession.id,
+                ResearchSession.question,
+                ResearchSession.status,
+                ResearchSession.request,
+                ResearchSession.error,
+                ResearchSession.created_at,
+                ResearchSession.updated_at,
+                source_count.label("source_count"),
+                evidence_count.label("evidence_count"),
+                claim_count.label("claim_count"),
+            ).where(ResearchSession.owner_id == owner_id)
             if search:
                 query = query.where(ResearchSession.question.contains(search, autoescape=True))
             column = ResearchSession.updated_at if sort == "updated" else ResearchSession.created_at
             query = query.order_by(column.asc() if sort == "oldest" else column.desc(), ResearchSession.id).limit(limit)
-            return [session_dict(row, include_state=False) for row in db.scalars(query)]
+            return [
+                {
+                    "id": row.id,
+                    "question": row.question,
+                    "status": row.status,
+                    "request": row.request,
+                    "error": row.error,
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                    "summary": {
+                        "source_count": row.source_count,
+                        "evidence_count": row.evidence_count,
+                        "claim_count": row.claim_count,
+                    },
+                }
+                for row in db.execute(query)
+            ]
 
     @staticmethod
     def _event(db, session_id: str, event_type: str, agent: str, message: str, data: dict | None = None):
@@ -308,25 +435,42 @@ class Database:
     def append_event(self, session_id: str, event_type: str, agent: str, message: str, data: dict | None = None):
         with self.sessions.begin() as db:
             row = db.get(ResearchSession, session_id)
-            if row is None or row.status == "cancelled":
+            if row is None or row.status not in ACTIVE_STATUSES:
                 return None
             return self._event(db, session_id, event_type, agent, message, data)
 
     def events(self, session_id: str, after: int = 0, limit: int | None = None) -> list[dict]:
         with self.sessions() as db:
+            limit = self.event_replay_limit if limit is None else min(limit, self.event_replay_limit)
+            limit = max(1, limit)
             query = select(ResearchEvent).where(ResearchEvent.session_id == session_id, ResearchEvent.id > after).order_by(ResearchEvent.id)
-            if limit:
-                query = query.limit(limit)
+            query = query.limit(limit)
             return [event_dict(row) for row in db.scalars(query)]
 
+    def _prune_events(self, db, session_id: str):
+        if self.event_audit_tail <= 0:
+            db.execute(delete(ResearchEvent).where(ResearchEvent.session_id == session_id))
+            return
+        retained_ids = select(ResearchEvent.id).where(
+            ResearchEvent.session_id == session_id
+        ).order_by(ResearchEvent.id.desc()).limit(self.event_audit_tail).scalar_subquery()
+        db.execute(delete(ResearchEvent).where(
+            ResearchEvent.session_id == session_id,
+            ResearchEvent.id.not_in(retained_ids),
+        ))
+
     def transition(self, session_id: str, status: str, *, error: str | None = None) -> bool:
+        if status not in SESSION_STATUSES:
+            raise ValueError(f"Invalid research session status: {status}")
         with self.sessions.begin() as db:
             row = db.scalar(select(ResearchSession).where(ResearchSession.id == session_id).with_for_update())
-            if row is None or row.status in TERMINAL_STATUSES:
+            if row is None or row.status not in SESSION_STATUSES or row.status in TERMINAL_STATUSES:
                 return False
             row.status, row.error, row.updated_at = status, error, now()
             row.state = {**row.state, "status": status}
             self._event(db, session_id, f"session_{status}", "orchestrator", error or f"Research {status}", {"status": status})
+            if status in TERMINAL_STATUSES:
+                self._prune_events(db, session_id)
         return True
 
     def recover_abandoned(self):
@@ -338,6 +482,7 @@ class Database:
                 row.error = "Execution interrupted by server restart. Latest checkpoint retained; submit a follow-up to continue."
                 row.updated_at = now()
                 self._event(db, row.id, "session_incomplete", "orchestrator", row.error, {"status": "incomplete"})
+                self._prune_events(db, row.id)
 
     def checkpoint(self, session_id: str, state: dict):
         with self.sessions.begin() as db:

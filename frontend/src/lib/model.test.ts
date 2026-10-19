@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { evidenceGraph } from '../components/Graph';
-import { mergeEvents, normalizeSession, normalizeState, safeUrl } from './model';
+import { documentHasActiveResearch, mergeEvents, normalizeSession, normalizeState, safeUrl } from './model';
 
 describe('contract mapping', () => {
   it('keeps flexible backend fields while defaulting absent collections to honest empties', () => {
@@ -15,6 +15,24 @@ describe('contract mapping', () => {
   it('merges replayed and live events by id in timeline order', () => {
     const event = (id: number, message: string) => ({ id, session_id: 's', event_type: 'stage', agent: 'planner', message, timestamp: `2026-01-01T00:00:0${id}Z` });
     expect(mergeEvents([event(1, 'old')], [event(1, 'replayed update'), event(2, 'new')]).map(e => e.message)).toEqual(['replayed update', 'new']);
+  });
+
+  it('keeps the browser timeline bounded while retaining the newest cursor window', () => {
+    const event = (id: number) => ({ id, session_id: 's', event_type: 'stage', agent: 'planner', message: String(id), timestamp: `2026-01-01T00:00:${String(id).padStart(2, '0')}Z` });
+    expect(mergeEvents([], [event(1), event(2), event(3)], 2).map(e => e.id)).toEqual([2, 3]);
+  });
+
+  it('turns malformed report and graph collections into safe empty or text values', () => {
+    const state = normalizeState({ plan: { subquestions: { invalid: true } }, report: { markdown: { invalid: true }, sections: { invalid: true }, citation_audit: { warnings: { invalid: true } } }, sources: [{ id: 'S1' }], claims: [{ id: 'C1', text: null, evidence_ids: null, contradicting_evidence_ids: null }] });
+    expect(state.plan.subquestions).toEqual([]);
+    expect(state.report.markdown).toBe('');
+    expect(state.report.sections).toEqual([]);
+    expect(state.claims[0].evidence_ids).toEqual([]);
+  });
+
+  it('marks documents reported as active as non-deletable', () => {
+    expect(documentHasActiveResearch({ id: 'doc-1', in_use: true })).toBe(true);
+    expect(documentHasActiveResearch({ id: 'doc-2', active_session_count: 0 })).toBe(false);
   });
 
   it('rejects unsafe citation URLs', () => {

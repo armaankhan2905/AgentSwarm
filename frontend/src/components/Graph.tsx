@@ -1,20 +1,26 @@
 import { useMemo, useState } from 'react';
 import { GitBranch, List, Network } from 'lucide-react';
 import type { ResearchState } from '../types';
-import { gapSources } from '../lib/model';
+import { gapSources, text } from '../lib/model';
 import { Badge, Button, Empty } from './ui';
 
 export interface GraphNode { id: string; label: string; kind: 'source' | 'claim' | 'gap' }
 export interface GraphEdge { from: string; to: string; label: string; contradicts?: boolean }
 export function evidenceGraph(state: ResearchState): { nodes: GraphNode[]; edges: GraphEdge[] } {
-  const nodes: GraphNode[] = [...state.sources.map(s => ({ id: s.id, label: s.title, kind: 'source' as const })), ...state.claims.map(c => ({ id: c.id, label: c.text, kind: 'claim' as const })), ...state.gaps.map(g => ({ id: g.id, label: g.title, kind: 'gap' as const }))];
+  const sources = Array.isArray(state?.sources) ? state.sources.filter(source => source && text(source.id)) : [];
+  const claims = Array.isArray(state?.claims) ? state.claims.filter(claim => claim && text(claim.id)) : [];
+  const gaps = Array.isArray(state?.gaps) ? state.gaps.filter(gap => gap && text(gap.id)) : [];
+  const evidence = Array.isArray(state?.evidence) ? state.evidence.filter(passage => passage && text(passage.id) && text(passage.source_id)) : [];
+  const nodes: GraphNode[] = [...sources.map(s => ({ id: text(s.id), label: text(s.title) || 'Untitled source', kind: 'source' as const })), ...claims.map(c => ({ id: text(c.id), label: text(c.text) || 'Untitled claim', kind: 'claim' as const })), ...gaps.map(g => ({ id: text(g.id), label: text(g.title) || 'Untitled gap', kind: 'gap' as const }))];
   const edges: GraphEdge[] = [];
-  for (const claim of state.claims) for (const source of state.sources) {
-    const passages = state.evidence.filter(p => p.source_id === source.id);
-    if (passages.some(p => claim.evidence_ids.includes(p.id))) edges.push({ from: source.id, to: claim.id, label: 'supports' });
-    if (passages.some(p => claim.contradicting_evidence_ids.includes(p.id))) edges.push({ from: source.id, to: claim.id, label: 'contradicts', contradicts: true });
+  for (const claim of claims) for (const source of sources) {
+    const passages = evidence.filter(p => p.source_id === source.id);
+    const supporting = Array.isArray(claim.evidence_ids) ? claim.evidence_ids.map(text) : [];
+    const contradicting = Array.isArray(claim.contradicting_evidence_ids) ? claim.contradicting_evidence_ids.map(text) : [];
+    if (passages.some(p => supporting.includes(p.id))) edges.push({ from: text(source.id), to: text(claim.id), label: 'supports' });
+    if (passages.some(p => contradicting.includes(p.id))) edges.push({ from: text(source.id), to: text(claim.id), label: 'contradicts', contradicts: true });
   }
-  for (const gap of state.gaps) for (const source of gapSources(gap, state.sources, state.evidence)) edges.push({ from: source.id, to: gap.id, label: 'cited by gap' });
+  for (const gap of gaps) for (const source of gapSources(gap, sources, evidence)) edges.push({ from: text(source.id), to: text(gap.id), label: 'cited by gap' });
   return { nodes, edges };
 }
 export function RelationshipGraph({ state, onSource, onClaim, onGap, gapsOnly = false }: { state: ResearchState; onSource: (id: string) => void; onClaim: (id: string) => void; onGap?: (id: string) => void; gapsOnly?: boolean }) {
