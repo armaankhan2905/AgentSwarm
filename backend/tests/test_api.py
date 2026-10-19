@@ -6,6 +6,7 @@ from copy import deepcopy
 from io import BytesIO
 import json
 import logging
+import threading
 import time
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ from app.database import (
     Claim, Conflict, Database, Document, Evidence, Followup, Gap, Plan,
     RateLimitBucket, Relationship, Report, ResearchEvent, ResearchSession, Source, Task,
 )
+import app.main as main_module
 from app.main import create_app
 
 
@@ -302,7 +304,9 @@ def test_pdf_upload_page_extraction_and_document_input(api):
     assert document["extraction_status"] == "extracted"
     assert [page["page"] for page in document["pages"]] == [1, 2]
     assert "Second page evidence." in document["pages"][1]["text"]
-    assert client.get("/api/documents").json() == [document]
+    listed = client.get("/api/documents").json()
+    assert listed[0] == {key: document[key] for key in ("id", "title", "extraction_status", "size_bytes", "text_chars", "created_at")}
+    assert "pages" not in listed[0]
     assert client.get(f"/api/documents/{document['id']}").json() == document
     inputs = []
 
@@ -400,6 +404,24 @@ def test_pdf_resource_signature_and_object_limits(tmp_path):
         assert response.status_code == 422 and "objects" in response.text
 
 
+def test_pdf_parser_timeout_is_bounded_without_killing_the_server(tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_parser(data, settings):
+        started.set()
+        release.wait(5)
+        return [], "no_text"
+
+    monkeypatch.setattr(main_module, "extract_pdf", slow_parser)
+    app = create_app(config(tmp_path, pdf_parse_timeout_seconds=1))
+    with TestClient(app, base_url="http://localhost", client=("127.0.0.1", 50000)) as client:
+        response = client.post("/api/documents", files={"file": ("slow.pdf", b"%PDF-1.7\n%%EOF", "application/pdf")})
+        assert started.is_set()
+        assert response.status_code == 422 and "timed out" in response.text
+        release.set()
+
+
 def test_health_readiness_and_redacted_request_correlation(tmp_path, caplog):
     app = create_app(config(tmp_path))
     with TestClient(app, base_url="http://localhost", client=("127.0.0.1", 50000)) as client:
@@ -461,6 +483,8 @@ def test_stream_uses_status_only_session_reads_and_terminal_event_retention(tmp_
         original_get = app.state.database.get_session
         app.state.database.get_session = lambda *args, **kwargs: pytest.fail("stream loaded the full JSON snapshot")
         try:
+            status = client.get(f"/api/research/{session_id}/status")
+            assert status.status_code == 200 and "state" not in status.json()
             assert client.get(f"/api/research/{session_id}/stream").status_code == 200
         finally:
             app.state.database.get_session = original_get
@@ -511,6 +535,13 @@ def test_local_auth_requires_loopback_peer_host_and_allowed_origin(tmp_path):
         assert client.get("/api/settings", headers={"Origin": "http://localhost:5173"}).status_code == 200
 
 
+def test_x_real_ip_is_only_honored_from_configured_proxy_network(tmp_path):
+    app = create_app(config(tmp_path, trusted_proxy_cidrs="203.0.113.0/24"))
+    with TestClient(app, base_url="http://public.example", client=("203.0.113.10", 50000)) as client:
+        assert client.get("/api/settings", headers={"X-Real-IP": "127.0.0.1"}).status_code == 200
+        assert client.get("/api/settings", headers={"X-Real-IP": "127.0.0.1, 203.0.113.10"}).status_code == 403
+
+
 @pytest.fixture
 def authenticated_api(tmp_path):
     app = create_app(config(tmp_path, auth_mode="supabase", cors_origins="https://research.example", supabase_url="https://auth.example", supabase_anon_key="anon-test-key"))
@@ -538,6 +569,7 @@ def test_supabase_verifies_tokens_and_isolates_history_and_every_child(authentic
     document = client.post("/api/documents", files={"file": ("owned.pdf", pdf_bytes("Owned evidence"), "application/pdf")}).json()
     client.headers["Authorization"] = "Bearer bob-token"
     assert client.get("/api/research").json() == []
+    assert client.get("/api/documents").json() == []
     for suffix in ("", "/plan", "/sources", "/claims", "/conflicts", "/gaps", "/report", "/events", "/claims/C1", "/stream", "/export?format=markdown", "/export?format=pdf"):
         assert client.get(f"/api/research/{session_id}{suffix}").status_code == 404, suffix
     assert client.post(f"/api/research/{session_id}/cancel").status_code == 404

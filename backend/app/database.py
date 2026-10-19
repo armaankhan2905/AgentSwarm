@@ -200,7 +200,7 @@ def session_status_dict(row) -> dict:
     """Return only the columns needed by status, cancellation, and stream loops."""
     return {
         key: row[key]
-        for key in ("id", "owner_id", "status", "error", "updated_at")
+        for key in ("id", "status", "error", "updated_at")
     }
 
 
@@ -237,14 +237,17 @@ class Database:
                 if "text_chars" not in columns:
                     connection.execute(sql_text("ALTER TABLE documents ADD COLUMN text_chars INTEGER NOT NULL DEFAULT 0"))
         else:
-            # The application owns this small operational table. Keeping its
-            # creation here avoids requiring a migration edit for deployments
-            # that already have the research schema installed.
-            RateLimitBucket.__table__.create(self.engine, checkfirst=True)
+            # PostgreSQL schema changes are migration-owned. Do not attempt to
+            # create tables from an API worker running with a least-privilege
+            # runtime role; readiness will fail clearly if migration 004 is
+            # missing instead of mutating the production schema implicitly.
+            return
 
     def readiness(self) -> bool:
         with self.sessions() as db:
             db.execute(sql_text("SELECT 1"))
+            if self.engine.dialect.name != "sqlite":
+                db.execute(sql_text("SELECT 1 FROM rate_limit_buckets LIMIT 1"))
         return True
 
     def consume_rate_limit(self, key: str, *, limit: int, window_seconds: float) -> RateLimitDecision:
@@ -352,7 +355,6 @@ class Database:
         with self.sessions() as db:
             query = select(
                 ResearchSession.id,
-                ResearchSession.owner_id,
                 ResearchSession.status,
                 ResearchSession.error,
                 ResearchSession.updated_at,
@@ -374,8 +376,25 @@ class Database:
 
     def list_documents(self, owner_id: str, limit: int = 1000) -> list[dict]:
         with self.sessions() as db:
-            query = select(Document).where(Document.owner_id == owner_id).order_by(Document.created_at, Document.id).limit(limit)
-            return [self.document_dict(row) for row in db.scalars(query)]
+            query = select(
+                Document.id,
+                Document.title,
+                Document.extraction_status,
+                Document.size_bytes,
+                Document.text_chars,
+                Document.created_at,
+            ).where(Document.owner_id == owner_id).order_by(Document.created_at, Document.id).limit(limit)
+            return [
+                {
+                    "id": row.id,
+                    "title": row.title,
+                    "extraction_status": row.extraction_status,
+                    "size_bytes": row.size_bytes,
+                    "text_chars": row.text_chars,
+                    "created_at": row.created_at,
+                }
+                for row in db.execute(query)
+            ]
 
     def count_active_sessions(self, owner_id: str) -> int:
         with self.sessions() as db:

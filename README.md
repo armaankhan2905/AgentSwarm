@@ -1,5 +1,4 @@
 # AgentSwarm
-
 AgentSwarm is an evidence-first research lab. A user submits a question, the
 backend plans bounded research, retrieves real sources or uploaded documents,
 stores passages, verifies claims, maps conflicts and gaps, and renders a
@@ -123,7 +122,7 @@ Before a shared deployment:
    `DEPLOYMENT_SCOPE=shared`, and provide the Supabase URL and public anon key.
 2. Use a PostgreSQL `DATABASE_URL` for a server-only database role and apply
    migrations `001_initial.sql`, `002_security_hardening.sql`, and
-   `003_deployment_privileges.sql` in order.
+   `003_deployment_privileges.sql`, and `004_rate_limit_buckets.sql` in order.
 3. Configure the LLM and selected search provider credentials only on the API.
 4. Keep the browser client on HTTPS and configure the allowed CORS origins.
 
@@ -146,7 +145,7 @@ the corresponding feature is used:
   enhancements.
 - `DATABASE_URL` must point to the migrated PostgreSQL/Supabase database for a
   shared deployment. SQLite is suitable for local development only. The
-  PostgreSQL runtime role must have `USAGE` on schema `public`, DML privileges
+PostgreSQL runtime role must have `USAGE` on schema `public`, DML privileges
   on every AgentSwarm table, and `USAGE`/`SELECT` on `public.events_id_seq`.
   Do not use the `anon` or `authenticated` roles for this connection. A
   dedicated server role should be non-public and have the RLS bypass required

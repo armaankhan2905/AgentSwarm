@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+import traceback
 from typing import Annotated, Literal
 from uuid import UUID
 from uuid import uuid4
@@ -354,6 +355,46 @@ def extract_pdf(data: bytes, settings: Settings) -> tuple[list[dict], str]:
         raise HTTPException(422, "PDF could not be parsed or its text could not be extracted") from None
 
 
+async def parse_pdf_bounded(
+    data: bytes,
+    settings: Settings,
+    semaphore: asyncio.Semaphore,
+) -> tuple[list[dict], str]:
+    """Run the parser with a timeout while keeping timed-out threads accounted for.
+
+    ``asyncio`` cannot safely kill a Python thread. A timed-out parser therefore
+    continues to completion, but it keeps its semaphore slot until it does so;
+    repeated hostile inputs cannot create an unbounded number of parser threads.
+    """
+    await semaphore.acquire()
+    task = asyncio.create_task(asyncio.to_thread(extract_pdf, data, settings))
+
+    async def release_when_done():
+        try:
+            await task
+        except BaseException:
+            pass
+        finally:
+            semaphore.release()
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.shield(task), timeout=settings.pdf_parse_timeout_seconds
+        )
+    except asyncio.TimeoutError:
+        asyncio.create_task(release_when_done())
+        raise
+    except BaseException:
+        if task.done():
+            semaphore.release()
+        else:
+            asyncio.create_task(release_when_done())
+        raise
+    else:
+        semaphore.release()
+        return result
+
+
 def report_pdf(title: str, markdown: str) -> bytes:
     output = BytesIO()
     document = SimpleDocTemplate(output, title=title, author="AgentSwarm", pagesize=(8.5 * inch, 11 * inch))
@@ -446,7 +487,14 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
     app.state.settings, app.state.database = settings, database
     app.state.engine_factory = None
     app.add_middleware(BodyLimitMiddleware, settings=settings)
-    app.add_middleware(CORSMiddleware, allow_origins=settings.origins, allow_credentials=False, allow_methods=["GET", "POST", "DELETE"], allow_headers=["Authorization", "Content-Type", "Last-Event-ID"], expose_headers=["Content-Disposition"])
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "Last-Event-ID", "X-Request-ID"],
+        expose_headers=["Content-Disposition", "X-Request-ID"],
+    )
 
     @app.middleware("http")
     async def request_logging(request: Request, call_next):
@@ -494,6 +542,7 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             settings,
             request_id=getattr(request.state, "request_id", ""),
             exception_type=type(exc).__name__,
+            traceback=traceback.format_exc(),
         )
         return JSONResponse({"detail": "The server could not complete this request"}, status_code=500)
 
@@ -633,6 +682,10 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
     async def get_research(session_id: str, user: User):
         return redact(owned_session(session_id, user), settings)
 
+    @app.get("/api/research/{session_id}/status")
+    async def research_status(session_id: str, user: User):
+        return redact(owned_session_status(session_id, user), settings)
+
     @app.post("/api/research/{session_id}/cancel")
     async def cancel_research(session_id: str, user: User):
         session = owned_session(session_id, user)
@@ -760,14 +813,10 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             data = await file.read(settings.max_upload_bytes + 1)
             if len(data) > settings.max_upload_bytes:
                 raise HTTPException(413, "PDF exceeds the upload size limit")
-            async with app.state.pdf_semaphore:
-                try:
-                    pages, status = await asyncio.wait_for(
-                        asyncio.to_thread(extract_pdf, data, settings),
-                        timeout=settings.pdf_parse_timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    raise HTTPException(422, "PDF parsing timed out") from None
+            try:
+                pages, status = await parse_pdf_bounded(data, settings, app.state.pdf_semaphore)
+            except asyncio.TimeoutError:
+                raise HTTPException(422, "PDF parsing timed out") from None
             # The original filename is display text only; no upload ever becomes a path.
             title = (file.filename or "Untitled PDF").replace("\\", "/").rsplit("/", 1)[-1]
             title = "".join(char for char in title if char.isprintable())[:200] or "Untitled PDF"
