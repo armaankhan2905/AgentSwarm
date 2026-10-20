@@ -198,16 +198,26 @@ class Providers:
         self.model = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         if self.llm_provider == "gemini":
             self.model = os.getenv("LLM_MODEL") or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        self.timeout = env_int("PROVIDER_TIMEOUT_SECONDS", 20, maximum=60)
+        if self.llm_provider == "ollama":
+            self.model = os.getenv("LLM_MODEL") or "qwen2.5:3b"
+        # Ollama local inference is slower — allow a longer wall-time ceiling.
+        default_timeout = 120 if self.llm_provider == "ollama" else 20
+        self.timeout = env_int("PROVIDER_TIMEOUT_SECONDS", default_timeout, maximum=300)
         self.retries = env_int("PROVIDER_RETRIES", 1, minimum=0, maximum=2)
         self.retriever = PublicPageRetriever()
 
     def validate(self, source_types: list[str]):
-        if self.llm_provider not in {"openai", "openai-compatible", "gemini"}:
-            raise ProviderError("LLM_PROVIDER must be openai, openai-compatible, or gemini")
-        key = "GEMINI_API_KEY" if self.llm_provider == "gemini" else "OPENAI_API_KEY"
-        if not (os.getenv("LLM_API_KEY") or os.getenv(key)):
-            raise ProviderError(f"Configure LLM_API_KEY (or {key}) and LLM_MODEL to run research")
+        if self.llm_provider not in {"openai", "openai-compatible", "gemini", "ollama"}:
+            raise ProviderError("LLM_PROVIDER must be openai, openai-compatible, gemini, or ollama")
+        # Ollama runs locally and requires no API key.
+        if self.llm_provider == "ollama":
+            base = os.getenv("LLM_BASE_URL") or "http://localhost:11434/v1"
+            if not base.startswith(("http://localhost", "http://127.0.0.1", "http://[::1]")):
+                raise ProviderError("Ollama LLM_BASE_URL must target a loopback address")
+        else:
+            key = "GEMINI_API_KEY" if self.llm_provider == "gemini" else "OPENAI_API_KEY"
+            if not (os.getenv("LLM_API_KEY") or os.getenv(key)):
+                raise ProviderError(f"Configure LLM_API_KEY (or {key}) and LLM_MODEL to run research")
         if "web" in source_types and not os.getenv("TAVILY_API_KEY"):
             raise ProviderError("Configure TAVILY_API_KEY for selected web research")
 
@@ -254,9 +264,9 @@ class Providers:
                 "POST", (os.getenv("LLM_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta").rstrip("/") + "/models/" + quote(self.model, safe="") + ":generateContent",
                 retries=0, headers={"x-goog-api-key": os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY", "")},
                 json={"systemInstruction": {"parts": [{"text": system}]},
-                      "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                      "contents": [{"role": "user", "parts": [{"text": prompt + "\n\nJSON_SCHEMA: " + json.dumps(schema.model_json_schema())}]}],
                       "generationConfig": {"temperature": 0, "maxOutputTokens": max_tokens,
-                                           "responseMimeType": "application/json", "responseJsonSchema": schema.model_json_schema()}},
+                                           "responseMimeType": "application/json"}},
             )
             try:
                 candidate = result["candidates"][0]
@@ -270,6 +280,101 @@ class Providers:
                 return LLMResult(json.loads(raw), usage.get("promptTokenCount"), output)
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 raise ProviderError("Gemini did not return valid structured output") from exc
+        if self.llm_provider == "ollama":
+            # Ollama exposes an OpenAI-compatible endpoint. We use response_format=json_object
+            # (verified compatible with qwen2.5:3b) and embed the schema in the prompt, because
+            # json_schema enforcement with $defs is not reliably supported by small local models.
+            base = (os.getenv("LLM_BASE_URL") or "http://localhost:11434/v1").rstrip("/")
+            # Role-specific guidance for small models that tend to return empty arrays
+            # or echo the JSON schema itself instead of populating data.
+            # These are structural instructions only — never inject untrusted evidence here.
+            _OLLAMA_ROLE_HINTS: dict[str, str] = {
+                "planner": (
+                    "\n\nIMPORTANT: Return actual planning data, NOT schema definitions.\n"
+                    "Example output shape:\n"
+                    '{"objective":"Identify findings for the research question.",'
+                    '"scope":"Academic sources only.",'
+                    '"subquestions":[{"id":"subq1","question":"Key research question?","priority":1,'
+                    '"source_types":["academic"],"queries":["topic query"],"evidence_requirements":["evidence"]}],'
+                    '"completion_criteria":["Identify core findings."],"known_limitations":["Limited sources."]}'
+                ),
+                "extractor": (
+                    "\n\nIMPORTANT: You MUST extract real claims from the passages above. "
+                    "Do NOT return an empty claims array. "
+                    "Each claim must: (1) use a valid subquestion_id from the plan, "
+                    "(2) have at least one quote with a valid evidence_id and an excerpt that "
+                    "is an EXACT copy of a substring from that passage\'s text field, "
+                    "(3) state a factual finding from the evidence.\n"
+                    "Example output shape:\n"
+                    '{"claims":[{"text":"Finding from evidence.","subquestion_id":"subq1",'
+                    '"quotes":[{"evidence_id":"E1","excerpt":"exact text from E1 passage"}]}]}'
+                ),
+                "semantic_verifier": (
+                    "\n\nIMPORTANT: Return a verdict for each supplied claim ID. "
+                    "Supporting quotes must use exact substrings from the passages.\n"
+                    "Example output shape:\n"
+                    '{"verdicts":[{"claim_id":"C1","status":"SUPPORTED","explanation":"Evidence directly supports the claim.",'
+                    '"supporting_quotes":[{"evidence_id":"E1","excerpt":"exact text from E1"}],"contradicting_quotes":[],'
+                    '"missing_evidence":[],"requires_follow_up":false}]}'
+                ),
+                "conflict_analyst": (
+                    "\n\nIMPORTANT: Identify genuine conflicts or return an empty array if none exist.\n"
+                    "Example output shape:\n"
+                    '{"conflicts":[]}'
+                ),
+                "gap_analyst": (
+                    "\n\nIMPORTANT: Return actual gap analysis data, NOT the schema definition. "
+                    "You MUST set complete (true/false) and explanation. "
+                    "Include at least one gap in the gaps array. "
+                    "POTENTIAL gaps do NOT require evidence_quotes.\n"
+                    "Example output shape:\n"
+                    '{"complete":false,"explanation":"Assessment of coverage.",'
+                    '"gaps":[{"id":"G1","title":"Identified Gap","description":"Description of missing evidence.",'
+                    '"category":"POTENTIAL","subquestion_id":"subq1","source_ids":["S1"],"evidence_ids":["E1"],'
+                    '"evidence_quotes":[],"existing_approaches":[],"significance":"Importance of gap.",'
+                    '"opportunity":"Future work opportunity.","limitations":[],"next_steps":[]}],'
+                    '"follow_up_queries":[{"subquestion_id":"subq1","query":"benefits of open source","source_type":"academic","reason":"Further research"}]}'
+                ),
+                "report_writer": (
+                    "\n\nIMPORTANT: Return report section structure with claim IDs. Keep section content empty string.\n"
+                    "Example output shape:\n"
+                    '{"title":"Research Report","sections":[{"id":"sec1","title":"Key Findings","content":"","claim_ids":["C1"]}]}'
+                ),
+            }
+            role_hint = _OLLAMA_ROLE_HINTS.get(role, "")
+            schema_hint = (
+                "\n\nReturn a JSON object matching this schema exactly "
+                "(only include fields listed here, no extras):\n"
+                + json.dumps(schema.model_json_schema(), indent=2)
+                + role_hint
+            )
+            try:
+                result = await self._json(
+                    "POST", base + "/chat/completions",
+                    retries=self.retries,
+                    json={"model": self.model, "temperature": 0, "max_tokens": max_tokens,
+                          "messages": [
+                              {"role": "system", "content": system},
+                              {"role": "user", "content": prompt + schema_hint},
+                          ],
+                          "response_format": {"type": "json_object"},
+                          "stream": False},
+                )
+            except ProviderError as exc:
+                if "network" in str(exc).lower() or "HTTP" in str(exc):
+                    raise ProviderError(
+                        "Ollama is unreachable at " + base + ". "
+                        "Start it with: ollama serve"
+                    ) from exc
+                raise
+            try:
+                choice = result["choices"][0]
+                if choice.get("finish_reason") not in {None, "stop"}:
+                    raise ProviderError("Ollama response was truncated — try reducing research depth or increasing PROVIDER_TIMEOUT_SECONDS")
+                usage = result.get("usage") or {}
+                return LLMResult(json.loads(choice["message"]["content"]), usage.get("prompt_tokens"), usage.get("completion_tokens"))
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                raise ProviderError("Ollama did not return valid JSON output") from exc
         base = (os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
         result = await self._json(
             "POST", base + "/chat/completions",

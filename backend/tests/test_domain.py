@@ -200,3 +200,87 @@ def test_missing_credentials_is_explicit(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(ProviderError, match="LLM_API_KEY"):
         Providers().validate(["document"])
+
+
+@pytest.mark.asyncio
+async def test_ollama_adapter_uses_json_object_format_and_embeds_schema(monkeypatch):
+    """Ollama path must use response_format=json_object and inject schema into prompt."""
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("LLM_MODEL", "qwen2.5:3b")
+    monkeypatch.setenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    captured = []
+
+    async def ollama_response(method, url, **kwargs):
+        captured.append((url, kwargs))
+        return {"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 5}}
+
+    providers = Providers()
+    monkeypatch.setattr(providers, "_json", ollama_response)
+    result = await providers.structured("planner", "my prompt", Plan, 400)
+    assert result.input_tokens == 20 and result.output_tokens == 5
+    payload = captured[-1][1]["json"]
+    # Must use json_object, not json_schema
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["model"] == "qwen2.5:3b"
+    assert payload["max_tokens"] == 400
+    # Schema must be embedded in the user message
+    user_msg = next(m["content"] for m in payload["messages"] if m["role"] == "user")
+    assert "schema" in user_msg.lower()
+    # No Authorization header — Ollama requires none
+    assert "Authorization" not in captured[-1][1].get("headers", {})
+
+
+@pytest.mark.asyncio
+async def test_ollama_unreachable_gives_clear_error(monkeypatch):
+    """When Ollama is not running the error message must point to 'ollama serve'."""
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("PROVIDER_RETRIES", "0")
+
+    async def network_fail(method, url, **kwargs):
+        raise ProviderError("Provider network request failed")
+
+    providers = Providers()
+    monkeypatch.setattr(providers, "_json", network_fail)
+    with pytest.raises(ProviderError, match="ollama serve"):
+        await providers.structured("planner", "data", Plan, 200)
+
+
+def test_ollama_validate_requires_no_api_key(monkeypatch):
+    """Ollama must be usable without LLM_API_KEY."""
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    for name in ("LLM_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    # Should not raise — no key required for ollama
+    Providers().validate(["document"])
+
+
+def test_ollama_validate_rejects_non_loopback_url(monkeypatch):
+    """Ollama must not be pointed at an external host."""
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("LLM_BASE_URL", "http://remote-ollama.example.com/v1")
+    with pytest.raises(ProviderError, match="loopback"):
+        Providers().validate(["document"])
+
+
+def test_ollama_no_cloud_fallback(monkeypatch):
+    """When provider is ollama, no cloud key is needed and provider stays ollama."""
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    for key in ("LLM_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    providers = Providers()
+    assert providers.llm_provider == "ollama"
+    Providers().validate(["document"])  # must not raise
+
+
+def test_ollama_defaults_applied(monkeypatch):
+    """Without explicit config, ollama should default to qwen2.5:3b and 120s timeout."""
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    providers = Providers()
+    assert providers.model == "qwen2.5:3b"
+    assert providers.timeout == 120

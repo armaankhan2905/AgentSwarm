@@ -133,8 +133,8 @@ class Settings(BaseSettings):
     @classmethod
     def provider_valid(cls, value: str) -> str:
         value = value.lower()
-        if value not in {"openai", "openai-compatible", "gemini"}:
-            raise ValueError("LLM_PROVIDER must be openai, openai-compatible, or gemini")
+        if value not in {"openai", "openai-compatible", "gemini", "ollama"}:
+            raise ValueError("LLM_PROVIDER must be openai, openai-compatible, gemini, or ollama")
         return value
 
     @field_validator("supabase_url")
@@ -164,9 +164,19 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_server(self) -> "Settings":
         if not self.llm_model:
-            self.llm_model = "gemini-2.5-flash" if self.llm_provider == "gemini" else "gpt-4o-mini"
+            if self.llm_provider == "gemini":
+                self.llm_model = "gemini-2.5-flash"
+            elif self.llm_provider == "ollama":
+                self.llm_model = "qwen2.5:3b"
+            else:
+                self.llm_model = "gpt-4o-mini"
         if not self.llm_base_url:
-            self.llm_base_url = "https://generativelanguage.googleapis.com/v1beta" if self.llm_provider == "gemini" else "https://api.openai.com/v1"
+            if self.llm_provider == "gemini":
+                self.llm_base_url = "https://generativelanguage.googleapis.com/v1beta"
+            elif self.llm_provider == "ollama":
+                self.llm_base_url = "http://localhost:11434/v1"
+            else:
+                self.llm_base_url = "https://api.openai.com/v1"
         if self.auth_mode == "supabase" and not (self.supabase_url and self.supabase_anon_key):
             raise ValueError("Supabase authentication requires SUPABASE_URL and SUPABASE_ANON_KEY")
         if self.auth_mode == "supabase" and is_service_role_key(self.supabase_anon_key):
@@ -195,17 +205,19 @@ class Settings(BaseSettings):
 
     def missing_credentials(self, source_types: list[str]) -> list[str]:
         missing = []
-        if not self.llm_api_key.strip():
+        # Ollama is a local service and requires no API key.
+        if self.llm_provider != "ollama" and not self.llm_api_key.strip():
             missing.append("LLM_API_KEY")
         if "web" in source_types and not self.tavily_api_key.strip():
             missing.append("TAVILY_API_KEY")
         return missing
 
     def public_status(self) -> dict:
+        llm_configured = (self.llm_provider == "ollama") or bool(self.llm_api_key)
         return {
             "auth_mode": self.auth_mode,
             "integrations": {
-                "llm": {"provider": self.llm_provider, "model": self.llm_model, "configured": bool(self.llm_api_key)},
+                "llm": {"provider": self.llm_provider, "model": self.llm_model, "configured": llm_configured},
                 "tavily": {"configured": bool(self.tavily_api_key)},
                 "openalex": {"configured": True, "api_key_configured": bool(self.openalex_api_key), "email_configured": bool(self.openalex_email)},
                 "supabase": {"configured": bool(self.supabase_url and self.supabase_anon_key)},

@@ -1,8 +1,11 @@
 # AgentSwarm
-AgentSwarm is an evidence-first research lab. A user submits a question, the
+AgentSwarm is an evidence-first multi-agent research lab. A user submits a question, the
 backend plans bounded research, retrieves real sources or uploaded documents,
 stores passages, verifies claims, maps conflicts and gaps, and renders a
 citation-audited report for inspection.
+
+It supports **100% local, offline LLM inference** via **Ollama** (qwen2.5:3b) with zero
+cloud API costs, as well as hosted cloud providers (Google Gemini and OpenAI).
 
 ## Requirements
 

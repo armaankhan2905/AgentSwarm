@@ -1,17 +1,68 @@
-.venv/
-__pycache__/
-.pytest_cache/
-*.pyc
+# Environments and secrets
 .env
+.env.local
 .env.*
 !.env.example
+!frontend/.env.example
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python compiled files and caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+
+# Node / Frontend
 node_modules/
+**/node_modules/
 dist/
-data/
+build/
+frontend/dist/
+frontend/build/
+*.tsbuildinfo
+.eslintcache
+
+# Databases & local state
+agentswarm.db
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+data/
+
+# Logs and temporary files
 *.log
-coverage/
-playwright-report/
+logs/
+tmp/
+temp/
+.temp/
 test-results/
+playwright-report/
+
+# Local models and weights
+*.gguf
+*.bin
+*.safetensors
+models/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

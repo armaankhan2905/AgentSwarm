@@ -40,6 +40,29 @@ class GraphSignal(TypedDict, total=False):
     route: str
 
 
+def _clean_schema_data(target_type: Any, val: Any) -> Any:
+    """Recursively strip fields not declared on target Pydantic models.
+
+    Prevents LLMs that generate extra metadata or commentary keys from triggering
+    extra='forbid' validation errors on nested Record objects.
+    """
+    if isinstance(val, dict) and isinstance(target_type, type) and issubclass(target_type, BaseModel):
+        cleaned = {}
+        for k, v in val.items():
+            if k in target_type.model_fields:
+                field_annotation = target_type.model_fields[k].annotation
+                cleaned[k] = _clean_schema_data(field_annotation, v)
+        return cleaned
+    if isinstance(val, list):
+        origin = getattr(target_type, "__origin__", None)
+        args = getattr(target_type, "__args__", ())
+        if origin is list and args:
+            item_type = args[0]
+            return [_clean_schema_data(item_type, item) for item in val]
+        return val
+    return val
+
+
 class ResearchEngine:
     def __init__(self, providers=None):
         self.providers = providers if providers is not None else Providers()
@@ -321,7 +344,10 @@ class _Execution:
         if result.output_tokens is not None and result.output_tokens > self.max_output:
             raise ProviderError("Provider exceeded the requested output token limit")
         try:
-            return schema.model_validate(result.data).model_dump(mode="json")
+            # Strip unknown keys recursively before validation so that LLMs that
+            # add extra commentary fields don't trip extra="forbid" on Record models.
+            data = _clean_schema_data(schema, result.data)
+            return schema.model_validate(data).model_dump(mode="json")
         except ValidationError as exc:
             raise ProviderError(f"Invalid {role} structured output ({exc.error_count()} schema errors)") from exc
 
